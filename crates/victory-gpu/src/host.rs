@@ -161,12 +161,12 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     // burst. Only discard reconstructible, idle copies; live lists retain
     // their references through the existing fence retirement path.
     if budget <= 8 << 30 {
-        return if used < share(80) {
-            (30_000, u64::MAX)
-        } else if used < share(90) {
-            (IDLE_MS, used.saturating_sub(share(75)))
+        return if used < share(78) {
+            (20_000, u64::MAX)
+        } else if used < share(88) {
+            (4_000, used.saturating_sub(share(72)))
         } else {
-            (SHORT_MS, used.saturating_sub(share(75)))
+            (1_200, used.saturating_sub(share(70)))
         };
     }
     if used < share(88) {
@@ -10709,9 +10709,9 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
-        assert_eq!(vram_keep(8 * gib, 6 * gib), (30_000, u64::MAX));
-        assert_eq!(vram_keep(8 * gib, 7 * gib), (5_000, gib));
-        assert_eq!(vram_keep(8 * gib, 8 * gib), (1_500, 2 * gib));
+        assert_eq!(vram_keep(8 * gib, 6 * gib), (20_000, u64::MAX));
+        assert_eq!(vram_keep(8 * gib, 7 * gib), (4_000, 7 * gib - (8 * gib * 72 / 100)));
+        assert_eq!(vram_keep(8 * gib, 8 * gib), (1_200, 8 * gib - (8 * gib * 70 / 100)));
     }
 
     #[test]

@@ -65,12 +65,15 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if budget != 0 && keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+        Some([budget, used, ..]) if budget != 0 && keep => {
+            let threshold = if budget <= 8 << 30 { 80 } else { 85 };
+            if u128::from(used) * 100 >= u128::from(budget) * threshold {
+                return 0;
+            }
             // Empty DEFAULT heaps are still resident. Retain at most 1/32 of
             // the current DXGI budget and 1/4 of its remaining headroom.
             (budget / 32 / BLOCK).min(budget.saturating_sub(used) / 4 / BLOCK).min(SPARE_KEPT as u64) as usize
         }
-        Some([budget, used, ..]) if budget != 0 && u128::from(used) * 100 >= u128::from(budget) * 85 => 0,
         _ => SPARE,
     }
 }
@@ -103,7 +106,17 @@ pub(crate) fn on() -> bool {
 /// no such lists: pieces are cut from those first.
 fn ahead() -> usize {
     static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    *AHEAD.get_or_init(|| {
+        std::env::var("VICTORY_RIPE_BLOCKS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| {
+                let small_vram = crate::host::host()
+                    .and_then(|h| h.video_memory())
+                    .is_some_and(|[budget, ..]| budget <= 8 << 30);
+                if small_vram { 3 } else { 12 }
+            })
+    })
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how

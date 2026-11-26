@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory)][string]$GameDir,
     [ValidateRange(10, 1800)][int]$TimeoutSeconds = 300
 )
@@ -16,9 +16,9 @@ Get-ChildItem Env:VICTORY_* | ForEach-Object { $original[$_.Name] = $_.Value }
 $settings = @{
     VICTORY_CACHE_DIR = Join-Path $env:LOCALAPPDATA 'VIctory\cache-rx6600'
     VICTORY_LOG = 'info'; VICTORY_LEVELS_ON_DEMAND = '1'
-    VICTORY_RELAY = '0'; VICTORY_LATE_WAIT = '0'; VICTORY_ASYNC_SUBMIT = '0'
-    VICTORY_THIN = '0'; VICTORY_JOIN_PARTS = '1'; VICTORY_UPLOAD_AHEAD = '0'
-    VICTORY_TEXTURE_NO_WAIT = '0'; VICTORY_RELAY_COPY = '0'
+    VICTORY_RELAY = '2'; VICTORY_LATE_WAIT = '3'; VICTORY_ASYNC_SUBMIT = '1'
+    VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '4'; VICTORY_UPLOAD_AHEAD = '1'
+    VICTORY_TEXTURE_NO_WAIT = '0'; VICTORY_RELAY_COPY = '1'
     VICTORY_UNDER_WIDE = '0'; VICTORY_LAND_ECHO = '0'; VICTORY_SHOW_AFTER = '1'
     VICTORY_AMBIENT = '0.8'; VICTORY_AMBIENT_AIR = '1.5'
     VICTORY_BVH_BUILDER = '0'; VICTORY_ACTIVATE_RAYS = '0'; VICTORY_RT_RESOLVE = '0'

@@ -1518,8 +1518,9 @@ impl State {
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
+        let mut barriers = Vec::with_capacity(self.targets.len() + 1);
         for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            crate::list::queue_state_barrier(list, t as This, RENDER_TARGET, &mut barriers);
         }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
@@ -1539,8 +1540,9 @@ impl State {
             } else {
                 DEPTH_WRITE
             };
-            crate::list::ensure_state(list, self.depth as This, state);
+            crate::list::queue_state_barrier(list, self.depth as This, state, &mut barriers);
         }
+        crate::list::flush_barriers(list, &mut barriers);
         true
     }
 
@@ -3725,10 +3727,11 @@ impl State {
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
+                let mut barriers = Vec::new();
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        readable_batched(list, u.kind, &view, &mut barriers);
                     }
                 }
                 for k in selected {
@@ -3739,9 +3742,10 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        readable_batched(list, kind, &view, &mut barriers);
                     }
                 }
+                crate::list::flush_barriers(list, &mut barriers);
                 let depth = TESTED_DEPTH.get().1;
                 TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
                 if once && let Some(known) = self.fresh_tables.get_mut(&key) {
@@ -3788,6 +3792,7 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            let mut barriers = Vec::new();
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3812,7 +3817,7 @@ impl State {
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
                             let _ = crate::residency::take_staging_deferred();
                             TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &view);
+                            readable_batched(list, kind, &view, &mut barriers);
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
@@ -3852,7 +3857,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable_batched(list, kind, &view, &mut barriers);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3876,6 +3881,7 @@ impl State {
                     }
                 }
             }
+            crate::list::flush_barriers(list, &mut barriers);
             made.push((slot, first * 32));
         }
         made
@@ -4585,6 +4591,17 @@ impl RecordHash {
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    let mut barriers = Vec::new();
+    readable_batched(list, kind, view, &mut barriers);
+    crate::list::flush_barriers(list, &mut barriers);
+}
+
+fn readable_batched(
+    list: &HostList,
+    kind: ResourceType,
+    view: &View,
+    barriers: &mut Vec<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER>,
+) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -4639,7 +4656,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            crate::list::queue_state_barrier(list, *resource as This, state, barriers);
             #[cfg(feature = "diagnostics")]
             if tracing::enabled!(tracing::Level::DEBUG)
                 && let Some(t) = crate::resource::host_resource(*resource as This)
@@ -4662,7 +4679,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
-                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+                crate::list::queue_state_barrier(list, *resource as This, UNORDERED_ACCESS, barriers);
             }
         }
         _ => {}

@@ -400,6 +400,212 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
+/// Whether failed/incompatible pixel shaders fall back to a safe null/diagnostic
+/// `ps_6_6` shader instead of dropping the entire draw (`VICTORY_FALLBACK_SHADERS=0` disables).
+fn fallback_shaders_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_SHADERS").is_none_or(|v| v != "0"))
+}
+
+/// Validates that translated DXIL bytecode is non-empty and starts with a DXBC container header.
+fn validate_dxil(bytes: &[u8]) -> bool {
+    bytes.len() >= 32 && &bytes[..4] == b"DXBC"
+}
+
+/// Computes the D3D12 root signature cost in 32-bit DWORDs (hardware limit is 64).
+fn root_signature_dwords(params: &[D3D12_ROOT_PARAMETER1]) -> u32 {
+    params
+        .iter()
+        .map(|p| match p.ParameterType {
+            // SAFETY: union variant matches `ParameterType`.
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => unsafe { p.Anonymous.Constants.Num32BitValues },
+            D3D12_ROOT_PARAMETER_TYPE_CBV
+            | D3D12_ROOT_PARAMETER_TYPE_SRV
+            | D3D12_ROOT_PARAMETER_TYPE_UAV => 2,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Sanitizes graphics state fields that AMD desktop Adrenalin drivers reject or hang on
+/// (e.g., `NumRenderTargets > 8`, `SampleDesc.Count == 0`, or `DepthEnable` with `DSVFormat == UNKNOWN`).
+fn sanitize_graphics_state(
+    g: &GraphicsState,
+) -> (
+    D3D12_DEPTH_STENCIL_DESC,
+    bool,
+    D3D12_RT_FORMAT_ARRAY,
+    DXGI_SAMPLE_DESC,
+) {
+    let mut targets = g.targets;
+    targets.NumRenderTargets = targets.NumRenderTargets.min(8);
+    let mut samples = g.samples;
+    if samples.Count == 0 {
+        samples.Count = 1;
+    }
+    let mut depth = g.depth;
+    let mut depth_bounds = g.depth_bounds;
+    if g.depth_format == DXGI_FORMAT_UNKNOWN {
+        depth.DepthEnable = false.into();
+        depth.StencilEnable = false.into();
+        depth_bounds = false;
+    }
+    (depth, depth_bounds, targets, samples)
+}
+
+/// Compiles a minimal `ps_6_6` fallback pixel shader via `dxcompiler.dll` once per
+/// render target count (`0..=8`), returning `None` if `dxcompiler.dll` is unavailable.
+fn fallback_pixel_dxil(rt_count: u32) -> Option<&'static [u8]> {
+    static CACHE: [std::sync::OnceLock<Option<Vec<u8>>>; 9] = [const { std::sync::OnceLock::new() }; 9];
+    let idx = (rt_count as usize).min(8);
+    CACHE[idx]
+        .get_or_init(|| compile_fallback_ps_6_6(idx))
+        .as_deref()
+}
+
+fn compile_fallback_ps_6_6(rt_count: usize) -> Option<Vec<u8>> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+
+    #[repr(C)]
+    struct Guid(u32, u16, u16, [u8; 8]);
+    #[repr(C)]
+    struct DxcBuffer {
+        ptr: *const c_void,
+        size: usize,
+        encoding: u32,
+    }
+    type Obj = *mut *const usize;
+    type CreateFn = unsafe extern "system" fn(*const Guid, *const Guid, *mut *mut c_void) -> i32;
+
+    const CLSID_DXC_COMPILER: Guid = Guid(0x73e22d93, 0xe6ce, 0x47f3, [0xb5, 0xbf, 0xf0, 0x66, 0x4f, 0x39, 0xc1, 0xb0]);
+    const IID_IDXC_COMPILER3: Guid = Guid(0x228b4687, 0x5a6a, 0x4730, [0x90, 0x0c, 0x97, 0x02, 0xb2, 0x20, 0x3f, 0x54]);
+    const IID_IDXC_RESULT: Guid = Guid(0x58346cda, 0xdde7, 0x4497, [0x94, 0x61, 0x6f, 0x87, 0xaf, 0x5e, 0x06, 0x59]);
+    const IID_IDXC_BLOB: Guid = Guid(0x8ba5fb08, 0x5195, 0x40e2, [0xac, 0x58, 0x0d, 0x98, 0x9c, 0x3a, 0x01, 0x02]);
+    const DXC_OUT_OBJECT: u32 = 1;
+
+    let hlsl = if rt_count == 0 {
+        "void main() {}\n".to_owned()
+    } else {
+        let mut s = String::from("struct Out {\n");
+        for i in 0..rt_count {
+            s.push_str(&format!("  float4 c{i} : SV_Target{i};\n"));
+        }
+        s.push_str("};\nOut main() {\n  Out o;\n");
+        for i in 0..rt_count {
+            s.push_str(&format!("  o.c{i} = float4(0.0, 0.0, 0.0, 1.0);\n"));
+        }
+        s.push_str("  return o;\n}\n");
+        s
+    };
+
+    let dll_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("dxcompiler.dll")))
+        .filter(|p| p.exists())
+        .or_else(|| {
+            victory_shader::emit::validator::Validator::default_path()
+                .map(|p| p.with_file_name("dxcompiler.dll"))
+                .filter(|p| p.exists())
+        });
+    let wide_dll: Vec<u16> = dll_path
+        .as_deref()
+        .map_or_else(|| "dxcompiler.dll".into(), |p| p.as_os_str().to_owned())
+        .to_string_lossy()
+        .encode_utf16()
+        .chain([0])
+        .collect();
+
+    unsafe fn slot<F: Copy>(obj: Obj, i: usize) -> F {
+        unsafe { std::mem::transmute_copy(&*(*obj).add(i)) }
+    }
+    unsafe fn release(obj: Obj) {
+        if !obj.is_null() {
+            unsafe { slot::<unsafe extern "system" fn(Obj) -> u32>(obj, 2)(obj) };
+        }
+    }
+
+    // SAFETY: standard COM calls into `dxcompiler.dll`.
+    unsafe {
+        let module = LoadLibraryW(wide_dll.as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        let create = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast())?;
+        let create: CreateFn = std::mem::transmute(create);
+        let mut compiler: *mut c_void = std::ptr::null_mut();
+        if create(&CLSID_DXC_COMPILER, &IID_IDXC_COMPILER3, &mut compiler) < 0 || compiler.is_null() {
+            return None;
+        }
+        let compiler_obj: Obj = compiler.cast();
+        let w = |s: &str| -> Vec<u16> { s.encode_utf16().chain([0]).collect() };
+        let a_e = w("-E");
+        let a_main = w("main");
+        let a_t = w("-T");
+        let a_ps = w("ps_6_6");
+        let args = [a_e.as_ptr(), a_main.as_ptr(), a_t.as_ptr(), a_ps.as_ptr()];
+        let src = DxcBuffer {
+            ptr: hlsl.as_ptr().cast(),
+            size: hlsl.len(),
+            encoding: 65001, // CP_UTF8
+        };
+        let compile_fn: unsafe extern "system" fn(
+            Obj,
+            *const DxcBuffer,
+            *const *const u16,
+            u32,
+            *mut c_void,
+            *const Guid,
+            *mut *mut c_void,
+        ) -> i32 = slot(compiler_obj, 3);
+        let mut result: *mut c_void = std::ptr::null_mut();
+        let hr = compile_fn(
+            compiler_obj,
+            &src,
+            args.as_ptr(),
+            args.len() as u32,
+            std::ptr::null_mut(),
+            &IID_IDXC_RESULT,
+            &mut result,
+        );
+        if hr < 0 || result.is_null() {
+            release(compiler_obj);
+            return None;
+        }
+        let result_obj: Obj = result.cast();
+        let mut status: i32 = -1;
+        let get_status: unsafe extern "system" fn(Obj, *mut i32) -> i32 = slot(result_obj, 4);
+        let _ = get_status(result_obj, &mut status);
+        let mut out = None;
+        if status >= 0 {
+            let mut blob: *mut c_void = std::ptr::null_mut();
+            let get_output: unsafe extern "system" fn(
+                Obj,
+                u32,
+                *const Guid,
+                *mut *mut c_void,
+                *mut *mut c_void,
+            ) -> i32 = slot(result_obj, 6);
+            if get_output(result_obj, DXC_OUT_OBJECT, &IID_IDXC_BLOB, &mut blob, std::ptr::null_mut()) >= 0
+                && !blob.is_null()
+            {
+                let blob_obj: Obj = blob.cast();
+                let ptr_fn: unsafe extern "system" fn(Obj) -> *const u8 = slot(blob_obj, 3);
+                let len_fn: unsafe extern "system" fn(Obj) -> usize = slot(blob_obj, 4);
+                let p = ptr_fn(blob_obj);
+                let n = len_fn(blob_obj);
+                if !p.is_null() && n >= 32 {
+                    out = Some(std::slice::from_raw_parts(p, n).to_vec());
+                }
+                release(blob_obj);
+            }
+        }
+        release(result_obj);
+        release(compiler_obj);
+        out
+    }
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -434,6 +640,8 @@ impl HostPipeline {
             );
         }
         let mesh = find("mesh");
+        let fallback_on = fallback_shaders_enabled();
+        let mut fallback_ps = false;
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
@@ -443,14 +651,27 @@ impl HostPipeline {
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            if let Some(ps) = find("pixel") {
+                if ps.translated().is_some() {
+                    stages.push((ps, D3D12_SHADER_VISIBILITY_PIXEL));
+                } else if fallback_on {
+                    tracing::warn!(hash = %ps.hash, ?shaders, "pixel shader failed translation; using safe fallback pixel shader");
+                    fallback_ps = true;
+                } else {
+                    return None;
+                }
+            }
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
-            s.translated()?;
+            let t = s.translated()?;
+            if !validate_dxil(&t.host.dxil) {
+                tracing::warn!(stage = s.stage, hash = %s.hash, len = t.host.dxil.len(), "refusing invalid/corrupt DXIL bytecode");
+                return None;
+            }
         }
         let host = host()?;
 
@@ -592,6 +813,11 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        let root_dwords = root_signature_dwords(&params);
+        if root_dwords > 64 {
+            tracing::warn!(root_dwords, ?shaders, "host root signature exceeds 64-DWORD D3D12 limit");
+            return None;
+        }
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -599,7 +825,24 @@ impl HostPipeline {
                 return None;
             }
         };
+        let mut fallback_ps_bytes: Option<&'static [u8]> = None;
+        if fallback_ps {
+            let rt_count = g.map_or(0, |s| s.targets.NumRenderTargets.min(8));
+            fallback_ps_bytes = fallback_pixel_dxil(rt_count);
+            if fallback_ps_bytes.is_none() {
+                tracing::warn!(?shaders, "fallback pixel shader unavailable; dropping pipeline");
+                return None;
+            }
+        }
         let code = |i: usize| {
+            if i == 1
+                && let Some(bytes) = fallback_ps_bytes
+            {
+                return D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                };
+            }
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
@@ -649,7 +892,8 @@ impl HostPipeline {
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
-        let depth_bounds = if g.depth_bounds {
+        let (sanitized_depth, sanitized_depth_bounds, sanitized_targets, sanitized_samples) = sanitize_graphics_state(g);
+        let depth_bounds = if sanitized_depth_bounds {
             if host.depth_bounds() {
                 true
             } else {
@@ -676,7 +920,27 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
+            let mut mesh_made = mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name);
+            if mesh_made.is_err()
+                && fallback_on
+                && !fallback_ps
+                && let Some(fb) = fallback_pixel_dxil(sanitized_targets.NumRenderTargets)
+            {
+                let ps_hash = find("pixel").map_or("none", |s| s.hash.as_str());
+                tracing::warn!(ps_hash, ?shaders, "mesh pipeline refused; retrying with safe fallback pixel shader");
+                let fb_code = D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: fb.as_ptr().cast(),
+                    BytecodeLength: fb.len(),
+                };
+                let fb_name = super::library::name(
+                    "mesh triangles fallback-ps",
+                    &root_blob,
+                    &[&code_bytes(&code(0)), fb],
+                    &state,
+                );
+                mesh_made = mesh_pipeline(&host.device, &root, code(0), fb_code, g, depth_bounds, &fb_name);
+            }
+            let pso = match mesh_made {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -724,10 +988,10 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: host_blend(&g.blend, &g.targets),
+            BlendState: host_blend(&g.blend, &sanitized_targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
-            DepthStencilState: g.depth,
+            DepthStencilState: sanitized_depth,
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
                 NumElements: g.inputs.len() as u32,
@@ -739,10 +1003,10 @@ impl HostPipeline {
                 RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
                 _ => g.topology,
             },
-            NumRenderTargets: g.targets.NumRenderTargets,
-            RTVFormats: g.targets.RTFormats,
+            NumRenderTargets: sanitized_targets.NumRenderTargets,
+            RTVFormats: sanitized_targets.RTFormats,
             DSVFormat: g.depth_format,
-            SampleDesc: g.samples,
+            SampleDesc: sanitized_samples,
             ..Default::default()
         };
         // A pipeline with the geometry stage has a name of its own in the
@@ -781,6 +1045,25 @@ impl HostPipeline {
             desc.GS = D3D12_SHADER_BYTECODE::default();
             rect_gs = None;
             made = make(&desc, &name(None));
+        }
+        if made.is_err()
+            && fallback_on
+            && !fallback_ps
+            && let Some(fb) = fallback_pixel_dxil(sanitized_targets.NumRenderTargets)
+        {
+            let ps_hash = find("pixel").map_or("none", |s| s.hash.as_str());
+            tracing::warn!(ps_hash, ?shaders, "graphics pipeline refused; retrying with safe fallback pixel shader");
+            desc.PS = D3D12_SHADER_BYTECODE {
+                pShaderBytecode: fb.as_ptr().cast(),
+                BytecodeLength: fb.len(),
+            };
+            let fb_name = super::library::name(
+                "graphics fallback-ps",
+                &root_blob,
+                &[&code_bytes(&code(0)), fb],
+                &state,
+            );
+            made = make(&desc, &fb_name);
         }
         let pso = match made {
             Ok(pso) => pso,

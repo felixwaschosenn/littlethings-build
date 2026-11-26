@@ -829,6 +829,40 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     }
 }
 
+/// Queues a texture state transition barrier into `barriers` without issuing an
+/// individual `ResourceBarrier` call; pair with [`flush_barriers`].
+#[cfg(windows)]
+pub(crate) fn queue_state_barrier(
+    list: &crate::host::HostList,
+    resource: This,
+    state: u32,
+    barriers: &mut Vec<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER>,
+) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+    if let Some((texture, before)) = list.transition(resource, state) {
+        let state = crate::host::legal_state(texture, state);
+        barriers.push(crate::host::transition(
+            texture,
+            State(before as i32),
+            State(state as i32),
+        ));
+    }
+}
+
+/// Issues all queued `ResourceBarrier` transitions in one batched driver call and
+/// clears `barriers`.
+#[cfg(windows)]
+pub(crate) fn flush_barriers(
+    list: &crate::host::HostList,
+    barriers: &mut Vec<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER>,
+) {
+    if !barriers.is_empty() {
+        // SAFETY: an open list and live textures kept by the list.
+        unsafe { list.list.ResourceBarrier(barriers) };
+        barriers.clear();
+    }
+}
+
 #[cfg(windows)]
 const COPY_DEST: u32 = 0x400;
 #[cfg(windows)]

@@ -151,7 +151,9 @@ pub(crate) fn critical_commit() -> bool {
 pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited: bool, staging: u64) -> u64 {
     if critical {
         bytes.min(16 << 20)
-    } else if pressure || (limited && staging >= GIB) {
+    } else if limited && staging >= 768 << 20 {
+        bytes.min(32 << 20)
+    } else if pressure {
         bytes.min(64 << 20)
     } else {
         bytes
@@ -189,8 +191,8 @@ mod tests {
 
     #[test]
     fn prefetch_respects_existing_budgets_and_resumes_after_recovery() {
-        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB), 64 << 20);
-        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB - 1), 512 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB), 32 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, false, true, (768 << 20) - 1), 512 << 20);
         assert_eq!(prefetch_limit(512 << 20, false, false, false, 2 * GIB), 512 << 20);
         assert_eq!(prefetch_limit(0, true, true, false, 0), 0);
         assert_eq!(prefetch_limit(8 << 20, true, true, false, 0), 8 << 20);
