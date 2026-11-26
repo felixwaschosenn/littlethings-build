@@ -82,6 +82,6 @@ cargo test --release --locked -p victory-gpu --lib small_card_texture_floor_stil
 
 An earlier Release test of `victory-shader` passed 282 tests; an audit of newly generated DXIL validated 1,960 entries. These results do not replace in-game stability testing.
 
-The architecture is documented in `docs/architecture.md`, and the asset policy is described in `docs/asset-policy.md`. See [LICENSE](LICENSE) for the project's GPL-3.0-or-later license and the third-party notices in the source code and documentation.
+The architecture is documented in `docs/architecture.md`, and the asset policy is described in `docs/asset-policy.md`. See [LICENSE](LICENSE) for the project's GPL-3.0-or-later license and [NOTICE.md](NOTICE.md) for its scope, the BCPack asset exception, and third-party licensing guidance.
 
 This project is independent and is not affiliated with or endorsed by Rockstar Games, Take-Two Interactive, or Microsoft. All trademarks belong to their respective owners.
