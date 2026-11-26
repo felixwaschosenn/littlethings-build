@@ -2650,12 +2650,16 @@ impl State {
         let bytes_at_most = if required || asked.is_some() {
             bytes_at_most
         } else {
-            crate::residency::prefetch_limit(
+            let host_limit = crate::residency::prefetch_limit(
                 bytes_at_most,
                 crate::residency::pressured(),
                 crate::residency::critical_commit(),
                 crate::residency::limited_host_ram(),
                 crate::texture::live_staging_bytes(),
+            );
+            crate::residency::vram_prefetch_limit(
+                host_limit,
+                crate::host::host().and_then(|h| h.video_memory()),
             )
         };
 

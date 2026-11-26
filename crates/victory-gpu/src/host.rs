@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_TIMEOUT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -310,10 +310,8 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
         a.value += 1;
         a.queue.Signal(&a.fence, a.value)?;
-        if a.fence.GetCompletedValue() < a.value {
-            a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
-        }
+        a.fence.SetEventOnCompletion(a.value, a.event)?;
+        wait_for_fence(device, &a.fence, a.event, a.value);
     }
     let us = started.elapsed().as_micros() as u64;
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
@@ -474,22 +472,33 @@ pub(crate) fn submissions() -> (u64, u64) {
 fn wait_for_fence(device: &ID3D12Device, fence: &ID3D12Fence, event: HANDLE, target: u64) {
     let began = std::time::Instant::now();
     loop {
-        // SAFETY: the event and fence belong to the caller's serialized queue.
-        let waited = unsafe { WaitForSingleObject(event, 500) };
+        // Check before waiting: a completed fence need not signal the event again.
+        // SAFETY: the fence belongs to the caller's serialized queue.
         let completed = unsafe { fence.GetCompletedValue() };
         // D3D12 returns UINT64_MAX on device removal, not a completed fence.
         if completed == u64::MAX {
             fail(format_args!("GPU device removed while waiting for fence {target}; refusing unsafe resource reuse"));
         }
         if completed >= target {
+            FENCE_WAITS[0].fetch_add(1, Ordering::Relaxed);
+            FENCE_WAITS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             return;
         }
         let removed = unsafe { device.GetDeviceRemovedReason() };
-        if waited != WAIT_TIMEOUT || removed.is_err() || began.elapsed() >= std::time::Duration::from_secs(30) {
-            fail(format_args!("GPU fence {target} did not complete (wait {waited:?}, device {removed:?}); refusing to reuse resources or copy back"));
+        if removed.is_err() || began.elapsed() >= std::time::Duration::from_secs(30) {
+            fail(format_args!("GPU fence {target} did not complete (completed {completed}, device {removed:?}); refusing to reuse resources or copy back"));
         }
+        // SAFETY: the event belongs to the caller's serialized queue.
+        let waited = unsafe { WaitForSingleObject(event, 500) };
+        if waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT {
+            fail(format_args!("GPU fence {target} wait failed ({waited:?}); refusing unsafe resource reuse"));
+        }
+        // A wake (including a stale event) is only a reason to query again.
     }
 }
+
+/// Completed synchronous waits and their total elapsed microseconds.
+static FENCE_WAITS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
@@ -2568,8 +2577,12 @@ static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 /// `completed`: everything ahead of the first flight it has not run. A
 /// later flight never lands before an earlier one, and what follows a
 /// flight (its bottom-of-pipe writes, signals) never before the flight.
-fn landable(line: &[Option<u64>], completed: u64) -> usize {
-    line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
+/// `None` means device removal, never successful completion of the line.
+fn landable(line: &[Option<u64>], completed: u64) -> Option<usize> {
+    if completed == u64::MAX {
+        return None;
+    }
+    Some(line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len()))
 }
 
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
@@ -2598,17 +2611,24 @@ mod relay_tests {
     fn flights_land_in_the_order_they_were_sent() {
         // Flight (fence 5), its write, a signal, flight (fence 6), its write.
         let line = [Some(5), None, None, Some(6), None];
-        assert_eq!(landable(&line, 4), 0);
-        assert_eq!(landable(&line, 5), 3);
-        assert_eq!(landable(&line, 6), 5);
-        assert_eq!(landable(&line, u64::MAX), 5);
+        assert_eq!(landable(&line, 4), Some(0));
+        assert_eq!(landable(&line, 5), Some(3));
+        assert_eq!(landable(&line, 6), Some(5));
+        assert_eq!(landable(&line, u64::MAX - 1), Some(5));
         // Signals with no flight ahead land at once; behind one they wait.
-        assert_eq!(landable(&[None, None], 0), 2);
-        assert_eq!(landable(&[None, Some(9), None], 8), 1);
-        assert_eq!(landable(&[], 3), 0);
+        assert_eq!(landable(&[None, None], 0), Some(2));
+        assert_eq!(landable(&[None, Some(9), None], 8), Some(1));
+        assert_eq!(landable(&[], 3), Some(0));
         // After the first three landed, the rest when its turn comes.
-        assert_eq!(landable(&line[3..], 5), 0);
-        assert_eq!(landable(&line[3..], 6), 2);
+        assert_eq!(landable(&line[3..], 5), Some(0));
+        assert_eq!(landable(&line[3..], 6), Some(2));
+    }
+
+    #[test]
+    fn device_removal_never_lands_flights_writes_or_signals() {
+        assert_eq!(landable(&[Some(5), None, None, Some(6)], u64::MAX), None);
+        assert_eq!(landable(&[None, None], u64::MAX), None);
+        assert_eq!(landable(&[], u64::MAX), None);
     }
 
     /// A piece flagged under one range of a plan is fetched under every
@@ -3467,7 +3487,11 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
-                let n = landable(&fences, completed);
+                let Some(n) = landable(&fences, completed) else {
+                    // Failure reporting may inspect relay state: release its lock first.
+                    drop(line);
+                    fail(format_args!("GPU device removed in relay; refusing to land flights, copy back or signal guest fences"));
+                };
                 if n == 0 {
                     // The first thing is a flight the card has not run.
                     break Err(fences[0].unwrap_or(0));
@@ -3494,14 +3518,10 @@ fn relay_worker() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                if let Err(e) = unsafe { host.fence.SetEventOnCompletion(target, event) } {
+                    fail(format_args!("could not arm relay fence {target}: {e}"));
                 }
+                wait_for_fence(&host.device, &host.fence, event, target);
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
@@ -8693,6 +8713,10 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 }
 
 const BUFFERS: u32 = 2;
+/// Presenter command lists may run while the CPU records later frames, but
+/// keeping more than a triple buffer only retains resources and increases
+/// latency. On the fourth frame, retire the oldest flights in one fence wait.
+const PRESENTS_IN_FLIGHT: usize = 3;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
@@ -8777,6 +8801,11 @@ impl Meter {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        let waits = FENCE_WAITS[0].swap(0, Ordering::Relaxed);
+        let waited_us = FENCE_WAITS[1].swap(0, Ordering::Relaxed);
+        let retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner()).len();
+        tracing::info!(waits, waited_ms = waited_us as f64 / 1000.0, retired_objects = retired,
+            "fence waits and objects awaiting retirement during this reporting interval");
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
@@ -9142,13 +9171,23 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
             let slot = if late_free_present() && !read_now {
-                let finished = FINISHED.load(Ordering::Acquire);
-                p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
+                let mut finished = FINISHED.load(Ordering::Acquire);
+                let mut free = p.ahead.iter().position(|(_, flown)| *flown <= finished);
+                if free.is_none() && p.ahead.len() < PRESENTS_IN_FLIGHT {
                     let list = self.new_list().ok()?;
                     list.close();
                     p.ahead.push((list, 0));
-                    Some(p.ahead.len() - 1)
-                })
+                    free = Some(p.ahead.len() - 1);
+                }
+                if free.is_none() {
+                    // Triple buffering is full. Settle all completed work in
+                    // one batch rather than allocating an unbounded list/resource
+                    // set or waiting once per submission.
+                    settle_for_present();
+                    finished = FINISHED.load(Ordering::Acquire);
+                    free = p.ahead.iter().position(|(_, flown)| *flown <= finished);
+                }
+                free
             } else {
                 None
             };

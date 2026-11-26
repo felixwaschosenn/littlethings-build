@@ -160,6 +160,31 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited
     }
 }
 
+/// Caps speculative texture traffic by the live DXGI local-memory budget.
+/// Required/bake uploads bypass this at the caller; only retryable lookahead
+/// is slowed, so pressure cannot turn into repeated VRAM <-> shared-memory
+/// paging on small cards.
+pub(crate) fn vram_prefetch_limit(bytes: u64, memory: Option<[u64; 4]>) -> u64 {
+    let Some([budget, used, ..]) = memory else {
+        return bytes;
+    };
+    if budget == 0 {
+        return bytes;
+    }
+    let percent = u128::from(used) * 100 / u128::from(budget);
+    if percent >= 90 {
+        0
+    } else if percent >= 85 {
+        bytes.min(16 << 20)
+    } else if percent >= 80 {
+        bytes.min(32 << 20)
+    } else if percent >= 75 {
+        bytes.min(64 << 20)
+    } else {
+        bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +224,14 @@ mod tests {
         assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
         assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
         assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
+    }
+
+    #[test]
+    fn speculative_prefetch_keeps_dxgi_headroom() {
+        let gib = 1 << 30;
+        assert_eq!(vram_prefetch_limit(512 << 20, Some([8 * gib, 6 * gib, 0, 0])), 64 << 20);
+        assert_eq!(vram_prefetch_limit(512 << 20, Some([8 * gib, 7 * gib, 0, 0])), 16 << 20);
+        assert_eq!(vram_prefetch_limit(512 << 20, Some([8 * gib, 8 * gib, 0, 0])), 0);
+        assert_eq!(vram_prefetch_limit(512 << 20, None), 512 << 20);
     }
 }

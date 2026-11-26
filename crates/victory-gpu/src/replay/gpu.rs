@@ -3,10 +3,16 @@
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::Foundation::{E_FAIL, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::core::{Interface, Result};
 
 use super::wire;
+
+/// Removal is not a completed submission, even though its sentinel is larger than every target.
+fn reusable(done: u64, target: u64) -> bool {
+    done != u64::MAX && done >= target
+}
 
 /// Lists of our own on a queue, with a fence.
 pub(super) struct Worker {
@@ -43,7 +49,12 @@ impl Worker {
         // SAFETY: lists and allocators of ours whose last run has finished.
         unsafe {
             let done = self.fence.GetCompletedValue();
-            let i = match self.lists.iter().position(|l| l.2 <= done) {
+            if done == u64::MAX {
+                self.device.GetDeviceRemovedReason()?;
+                return Err(windows::core::Error::new(E_FAIL, "fence reports device removal"));
+            }
+            self.device.GetDeviceRemovedReason()?;
+            let i = match self.lists.iter().position(|l| reusable(done, l.2)) {
                 Some(i) => i,
                 None => {
                     let allocator: ID3D12CommandAllocator = self
@@ -82,13 +93,26 @@ impl Worker {
     }
 
     pub(super) fn wait(&self, value: u64) -> Result<()> {
+        let began = std::time::Instant::now();
         // SAFETY: our fence and event.
         unsafe {
-            if self.fence.GetCompletedValue() < value {
-                self.fence.SetEventOnCompletion(value, self.event)?;
-                WaitForSingleObject(self.event, INFINITE);
+            self.fence.SetEventOnCompletion(value, self.event)?;
+            loop {
+                let done = self.fence.GetCompletedValue();
+                if done == u64::MAX {
+                    self.device.GetDeviceRemovedReason()?;
+                    return Err(windows::core::Error::new(E_FAIL, "fence reports device removal"));
+                }
+                self.device.GetDeviceRemovedReason()?;
+                if reusable(done, value) { return Ok(()); }
+                if began.elapsed() >= std::time::Duration::from_secs(30) {
+                    return Err(windows::core::Error::new(E_FAIL, "GPU fence timed out"));
+                }
+                let waited = WaitForSingleObject(self.event, 500);
+                if waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT {
+                    return Err(windows::core::Error::new(E_FAIL, "GPU fence event wait failed"));
+                }
             }
-            self.device.GetDeviceRemovedReason()
         }
     }
 
@@ -437,6 +461,14 @@ pub(super) fn adapter(device: &ID3D12Device) -> (String, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_fence_never_reuses_an_allocator_or_completes_a_wait() {
+        assert!(!reusable(u64::MAX, 0));
+        assert!(!reusable(u64::MAX, 7));
+        assert!(!reusable(6, 7));
+        assert!(reusable(7, 7));
+    }
 
     #[test]
     fn pictures() {

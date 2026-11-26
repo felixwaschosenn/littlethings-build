@@ -16,10 +16,34 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::Interface;
+
+fn wait_awake(device: &ID3D12Device, fence: &ID3D12Fence, event: HANDLE, target: u64) -> windows::core::Result<()> {
+    // SAFETY: this worker owns the fence and event for its queue.
+    unsafe {
+        fence.SetEventOnCompletion(target, event)?;
+        let began = std::time::Instant::now();
+        loop {
+            let done = fence.GetCompletedValue();
+            if done == u64::MAX {
+                device.GetDeviceRemovedReason()?;
+                return Err(windows::core::Error::new(E_FAIL, "awake fence reports device removal"));
+            }
+            device.GetDeviceRemovedReason()?;
+            if done >= target { return Ok(()); }
+            if began.elapsed() >= Duration::from_secs(30) {
+                return Err(windows::core::Error::new(E_FAIL, "awake fence timed out"));
+            }
+            let waited = WaitForSingleObject(event, 500);
+            if waited != WAIT_OBJECT_0 && waited != WAIT_TIMEOUT {
+                return Err(windows::core::Error::new(E_FAIL, "awake fence event wait failed"));
+            }
+        }
+    }
+}
 
 /// About 2 ms at full clocks: 500 sends a second.
 const COUNT: &str = r#"
@@ -184,20 +208,21 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
                 continue;
             }
             // Never more than two on the way.
-            if value >= 2 && fence.GetCompletedValue() + 2 <= value {
-                result = fence.SetEventOnCompletion(value - 1, event);
-                if result.is_ok() {
-                    WaitForSingleObject(event, 1000);
-                    result = device.GetDeviceRemovedReason();
-                }
+            let completed = fence.GetCompletedValue();
+            if completed == u64::MAX {
+                result = device.GetDeviceRemovedReason().and_then(|()| Err(windows::core::Error::new(E_FAIL, "awake device removed")));
+                break;
+            }
+            if value >= 2 && completed <= value.saturating_sub(2) {
+                result = wait_awake(device, &fence, event, value - 1);
                 continue;
             }
             queue.ExecuteCommandLists(&lists[(value % 2) as usize..][..1]);
             value += 1;
             result = queue.Signal(&fence, value);
         }
-        if result.is_ok() && fence.GetCompletedValue() < value && fence.SetEventOnCompletion(value, event).is_ok() {
-            WaitForSingleObject(event, INFINITE);
+        if result.is_ok() {
+            result = wait_awake(device, &fence, event, value);
         }
         let _ = CloseHandle(event);
         result
