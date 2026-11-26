@@ -77,8 +77,3 @@ Ou diretamente:
 ```powershell
 .\target\release\victory.exe run 'C:\Users\Usuario\Downloads\ABDM\Compressed\GTA6xbox\game_scarlett_master.exe' --console series-s --execute
 ```
-
-### Publicar a Branch no GitHub
-```powershell
-git push -u origin rdna2-20fps-overhaul
-```
