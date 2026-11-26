@@ -39,15 +39,15 @@ rustup toolchain install 1.98.1 --profile minimal --target x86_64-pc-windows-msv
 cargo build --release --locked -p victory
 ```
 
-The executable is created at `target\\release\\victory.exe`. Copy the x64 DLLs from the Windows SDK into the same directory (adjust the SDK version if needed):
+The executable is created at `target\release\victory.exe`. Copy the x64 DLLs from the Windows SDK into the same directory (adjust the SDK version if needed):
 
 ```powershell
-$sdk = Get-ChildItem "${env:ProgramFiles(x86)}\\Windows Kits\\10\\bin" -Directory |
-  Where-Object { (Test-Path (Join-Path $_.FullName 'x64\\dxcompiler.dll')) -and (Test-Path (Join-Path $_.FullName 'x64\\dxil.dll')) } |
+$sdk = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory |
+  Where-Object { (Test-Path (Join-Path $_.FullName 'x64\dxcompiler.dll')) -and (Test-Path (Join-Path $_.FullName 'x64\dxil.dll')) } |
   Sort-Object Name -Descending | Select-Object -First 1
 if (-not $sdk) { throw 'x64 DXC/DXIL not found in the Windows SDK.' }
-Copy-Item (Join-Path $sdk.FullName 'x64\\dxcompiler.dll') .\\target\\release\\
-Copy-Item (Join-Path $sdk.FullName 'x64\\dxil.dll') .\\target\\release\\
+Copy-Item (Join-Path $sdk.FullName 'x64\dxcompiler.dll') .\target\release\
+Copy-Item (Join-Path $sdk.FullName 'x64\dxil.dll') .\target\release\
 ```
 
 ## Run with a timeout
@@ -55,21 +55,21 @@ Copy-Item (Join-Path $sdk.FullName 'x64\\dxil.dll') .\\target\\release\\
 Keep your dump directory **outside the repository checkout**. Example:
 
 ```powershell
-.\\scripts\\run-rx6600.ps1 -GameDir 'C:\\path\\to\\your\\dump' -TimeoutSeconds 300
+.\scripts\run-rx6600.ps1 -GameDir 'C:\path\to\your\dump' -TimeoutSeconds 300
 ```
 
 You can also use:
 
 ```powershell
-.\\Play-VIctory.cmd "C:\\path\\to\\your\\dump"
+.\Play-VIctory.cmd "C:\path\to\your\dump"
 ```
 
-The script writes logs and a result file to `%LOCALAPPDATA%\\VIctory\\logs\\rx6600`, uses the cache at `%LOCALAPPDATA%\\VIctory\\cache-rx6600`, and terminates only the process it launched when the timeout is reached.
+The script writes logs and a result file to `%LOCALAPPDATA%\VIctory\logs\rx6600`, uses the cache at `%LOCALAPPDATA%\VIctory\cache-rx6600`, and terminates only the process it launched when the timeout is reached.
 
 To launch directly, without the profile or timeout:
 
 ```powershell
-.\\target\\release\\victory.exe run 'C:\\path\\to\\your\\dump\\game_scarlett_master.exe' --console series-s --execute
+.\target\release\victory.exe run 'C:\path\to\your\dump\game_scarlett_master.exe' --console series-s --execute
 ```
 
 ## Verification and provenance
